@@ -1,0 +1,646 @@
+#include <string>
+#include <assert.h>
+#include "cache.h"
+#include "prefetcher.h"
+#include "ooo_cpu.h"
+#include "control_udc.h"
+
+/* Supported prefetchers at L2 */
+#include "sms.h"
+#include "next_line.h"
+#include "bop.h"
+#include "sandbox.h"
+#include "spp_dev2.h"
+#include "ppf_dev.h"
+#include "stride.h"
+#include "streamer.h"
+#include "domino.h"
+#include "sisb.h"
+#include "bingo.h"
+#include "vberti.h"
+#include "pmp.h"
+#include "prophet.h"
+
+#include <memory>
+
+using namespace std;
+
+namespace knob
+{
+	extern vector<string> l2c_prefetcher_types;
+	extern uint32_t pref_degree;
+	extern uint32_t udc_ideal_dram_time;
+	extern uint32_t phase_length;
+}
+
+UDC udc[NUM_CPUS];
+bool final_pe_reset = false;
+
+ostream &operator<<(ostream &os, const BoolPrefetchers &prefetchers)
+{
+	for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+	{
+		os << prefetchers.data[i];
+	}
+	return os;
+}
+
+ostream &operator<<(ostream &os, const vector<int16_t> &state)
+{
+	for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+	{
+		os << " " << state[i];
+	}
+	os << " ";
+	return os;
+}
+
+UDC::UDC(/* args */) : current_state(NUM_PREFETCHERS, knob::pref_degree)
+{
+
+	for (size_t i = 0; i < UDC_PF_ADDR_TABLE_SIZE; i++)
+	{
+		pf_addr_table[i].reset();
+	}
+	for (size_t i = 0; i < UDC_PO_ADDR_TABLE_SIZE; i++)
+	{
+		poll_bf[i].reset();
+	}
+	reset_counters();
+
+	pollution_contribution_total = 0;
+	pollution_contribution_count = 0;
+
+	cout << "IPOP t-noc=" << T_NOC << ", t-cmd=" << T_CMD_BUS << ", t-data=" << T_DATA_BUS << ", t-idealdram=" << knob::udc_ideal_dram_time << ", phase-length=" << knob::phase_length << endl;
+}
+
+void UDC::reset_counters()
+{
+	demand_count = 0;
+	pollution_count_all = 0;
+	for (size_t i = 0; i < NUM_PREFETCHERS; i++)
+	{
+		pollution_count_l3[i] = 0;
+		pollution_count_dram[i] = 0;
+		useful_count_l3[i] = 0;
+		useful_count_dram[i] = 0;
+		fill_count[i] = 0;
+	}
+	for (size_t i = 0; i < DRAM_CHANNELS; i++)
+	{
+		last_row_buffer_hit[i] = uncore.DRAM.RQ[i].ROW_BUFFER_HIT;
+		last_row_buffer_miss[i] = uncore.DRAM.RQ[i].ROW_BUFFER_MISS;
+	}
+}
+
+UDC::~UDC()
+{
+}
+
+void UDC::prefetch_fill(uint64_t address, bool from_dram, uint32_t latency, BoolPrefetchers issue_prefetcher)
+{
+	uint64_t block_addr = address >> LOG2_BLOCK_SIZE;
+	uint16_t index = hash_index_xor(block_addr, lg2(UDC_PF_ADDR_TABLE_SIZE)) % UDC_PF_ADDR_TABLE_SIZE;
+	uint16_t tag = (block_addr >> lg2(UDC_PF_ADDR_TABLE_SIZE)) & ((1ULL << UDC_PF_ADDR_TABLE_TAG) - 1);
+	if (pf_addr_table[index].tag != tag)
+		pf_addr_table[index].reset();
+	pf_addr_table[index].tag = tag;
+	pf_addr_table[index].from_dram = from_dram;
+	// cout << latency;
+	pf_addr_table[index].latency = latency;
+	for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+	{
+		pf_addr_table[index].issue_prefetcher.data[i] = issue_prefetcher.data[i];
+		if (issue_prefetcher.data[i])
+			fill_count[i]++;
+	}
+
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[prefetch_fill]: block_addr=0x" << hex << block_addr << ", pf_table_index=" << dec << index << endl
+			 << "find_tag=0x" << hex << tag << ", origin_tag=0x" << (int)pf_addr_table[index].tag << endl
+			 << "from_dram=" << from_dram << ", issue_prefetcher=" << issue_prefetcher << endl;
+	}
+}
+
+void UDC::cache_hit(uint64_t address)
+{
+	// search PfAddrTable, add useful counters
+	uint64_t block_addr = address >> LOG2_BLOCK_SIZE;
+	uint16_t index = hash_index_xor(block_addr, lg2(UDC_PF_ADDR_TABLE_SIZE)) % UDC_PF_ADDR_TABLE_SIZE;
+	uint16_t tag = (block_addr >> lg2(UDC_PF_ADDR_TABLE_SIZE)) & ((1ULL << UDC_PF_ADDR_TABLE_TAG) - 1);
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[cache_hit]: block_addr=0x" << hex << block_addr << ", pf_table_index=" << dec << index << endl
+			 << "find_tag=0x" << hex << tag << "origin_tag=0x" << (int)pf_addr_table[index].tag << endl;
+	}
+
+	if (pf_addr_table[index].tag == tag)
+	{
+		if (UDC_DEBUG_LEVEL >= 2)
+			cout << "hit! from_dram=" << pf_addr_table[index].from_dram << ", issue_prefetcher=" << pf_addr_table[index].issue_prefetcher << endl;
+		if (pf_addr_table[index].from_dram)
+		{
+			if (UDC_DEBUG_LEVEL >= 2)
+				cout << "useful_dram_count=" << dec;
+			for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+			{
+				if (pf_addr_table[index].issue_prefetcher.data[i])
+				{
+					useful_count_dram[i]++;
+					if (UDC_DEBUG_LEVEL >= 2)
+						cout << " " << useful_count_dram[i];
+				}
+			}
+		}
+		else
+		{
+			if (UDC_DEBUG_LEVEL >= 2)
+				cout << "useful_l3_count=" << dec;
+			for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+			{
+				if (pf_addr_table[index].issue_prefetcher.data[i])
+				{
+					useful_count_l3[i]++;
+					if (UDC_DEBUG_LEVEL >= 2)
+						cout << " " << useful_count_l3[i];
+				}
+			}
+		}
+
+		pf_addr_table[index].reset();
+		if (UDC_DEBUG_LEVEL >= 2)
+			cout << endl;
+	}
+}
+
+void UDC::cache_miss_fill(uint64_t address, int hit_level)
+{
+	// check for prefetching pollution
+	uint64_t block_addr = address >> LOG2_BLOCK_SIZE;
+	uint32_t index = hash_index_xor(block_addr, lg2(UDC_PO_ADDR_TABLE_SIZE)) % UDC_PO_ADDR_TABLE_SIZE;
+	uint16_t tag = (block_addr >> lg2(UDC_PO_ADDR_TABLE_SIZE)) & ((1ULL << UDC_PO_ADDR_TABLE_TAG) - 1);
+
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[cache_miss]: block_addr=0x" << hex << block_addr << ", index=" << dec << index << ", find_tag=0x" << hex << (int)tag << endl;
+	}
+
+	if (poll_bf[index].tag == tag)
+	{
+		// stat
+		pollution_count_all++;
+
+		for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+		{
+			if (poll_bf[index].issue_prefetcher.data[i]){
+				if (hit_level == FILL_LLC)
+					pollution_count_l3[i]++;
+				else if (hit_level == FILL_DRAM)
+					pollution_count_dram[i]++;
+			}
+		}
+
+		if (UDC_DEBUG_LEVEL >= 2)
+		{
+			cout << "Cause pollution! poll_prefetcher=" << poll_bf[index].issue_prefetcher << endl;
+		}
+		poll_bf[index].reset();
+	}
+
+}
+
+void UDC::prefetch_caused_eviction(uint32_t set, uint64_t evict_address, BoolPrefetchers issue_prefetcher)
+{
+	uint64_t block_addr = evict_address >> LOG2_BLOCK_SIZE;
+	uint32_t index = hash_index_xor(block_addr, lg2(UDC_PO_ADDR_TABLE_SIZE)) % UDC_PO_ADDR_TABLE_SIZE;
+	uint16_t tag = (block_addr >> lg2(UDC_PO_ADDR_TABLE_SIZE)) & ((1ULL << UDC_PO_ADDR_TABLE_TAG) - 1);
+
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[prefetch_caused_eviction]: evict_block_addr=0x" << hex << block_addr << endl
+				<< ", index=" << dec << index << ", tag=" << hex << (int)tag << ", issue_prefetcher=" << issue_prefetcher << endl;
+	}
+	poll_bf[index].reset();
+	poll_bf[index].tag = tag;
+	poll_bf[index].issue_prefetcher = issue_prefetcher;
+};
+
+void UDC::get_control_result(float lat_l3, float lat_dram, uint64_t dram_count, uint64_t *delay_count, uint64_t *same_channel_count, uint64_t *same_bank_count)
+{
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "old_state=" << current_state << endl;
+	}
+
+	vector<int64_t> effect(NUM_PREFETCHERS, 0);
+	for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+	{
+		int64_t useful_effect = 0, poll_effect = 0, delay_effect = 0;
+		float row_buffer_miss_rate = 0;
+		for (size_t channel = 0; channel < DRAM_CHANNELS; channel++)
+		{
+			row_buffer_miss_rate += 1.0 * (uncore.DRAM.RQ[channel].ROW_BUFFER_MISS - last_row_buffer_miss[channel]) / (uncore.DRAM.RQ[channel].ROW_BUFFER_MISS - last_row_buffer_miss[channel] + uncore.DRAM.RQ[channel].ROW_BUFFER_HIT - last_row_buffer_hit[channel]);
+		}
+		row_buffer_miss_rate = row_buffer_miss_rate / DRAM_CHANNELS;
+		useful_effect = (int64_t)(useful_count_l3[i] * lat_l3 + useful_count_dram[i] * lat_dram);
+		poll_effect = (int64_t)(pollution_count_l3[i] * lat_l3 + pollution_count_dram[i] * lat_dram);
+		// delay_effect = (int64_t)(delay_count[i] * T_BUS + same_bank_count[i] * (tCAS + row_buffer_miss_rate * (tRP + tRCD)));
+		float t_bus = (1 + 2 * row_buffer_miss_rate) * T_CMD_BUS + T_DATA_BUS;
+		float t_bank = tCAS + row_buffer_miss_rate * (tRP + tRCD);
+		if (NUM_CPUS == 1)
+			delay_effect = (int64_t)(t_bus * same_channel_count[i] + t_bank * same_bank_count[i]);
+		else
+			delay_effect = (int64_t)(T_NOC * delay_count[i] + t_bus * same_channel_count[i] + t_bank * same_bank_count[i]);
+		effect[i] = useful_effect - poll_effect - delay_effect;
+
+		if ((poll_effect + delay_effect) != 0){
+			pollution_contribution_total += 1.0 * poll_effect / (poll_effect + delay_effect);
+			pollution_contribution_count++;
+		}
+
+		if (UDC_DEBUG_LEVEL >= 2)
+		{
+			cout << "[get_control_result]--Prefetcher " << dec << i << ":" << endl
+				 << "\tuseful_effect=" << useful_effect << "\tcount_l3=" << useful_count_l3[i] << "\tlat_l3=" << lat_l3 << "\tcount_dram=" << useful_count_dram[i] << "\tlat_dram=" << lat_dram << endl
+				 << "\tpoll_effect=" << poll_effect << "\tcount_l3=" << pollution_count_l3[i] << "\tlat_l3=" << lat_l3 << "\tcount_dram=" << pollution_count_dram[i] << "\tlat_dram=" << lat_dram << endl
+				 << "\tdelay_effect=" << delay_effect << "\tdelay_count=" << delay_count[i] << "\tsame_bank=" << same_bank_count[i] << endl
+				 << "\tall_effect=" << effect[i] << endl;
+		}
+	}
+#ifdef UDC_DYNAMIC_DEGREE
+	int64_t norm_effect[NUM_PREFETCHERS];
+	int64_t max_effect = INT64_MIN, max_index = -1;
+	int64_t min_effect = INT64_MAX, min_index = -1;
+	for (size_t i = 0; i < NUM_PREFETCHERS; i++)
+	{
+		if (current_state[i] > 0)
+		{
+			// norm_effect[i] = effect[i] / current_state[i];
+			// if (fill_count[i] != 0)
+			// norm_effect[i] = effect[i] / fill_count[i];
+			// else
+			norm_effect[i] = effect[i];
+			if (current_state[i] < UDC_HIGH_DEGREE && norm_effect[i] > max_effect)
+			{
+				max_effect = norm_effect[i];
+				max_index = i;
+			}
+			if (current_state[i] > UDC_LOW_DEGREE && norm_effect[i] < min_effect)
+			{
+				min_effect = norm_effect[i];
+				min_index = i;
+			}
+		}
+	}
+	if (lat_dram > 3 * knob::udc_ideal_dram_time && min_index >= 0)
+	{
+		current_state[min_index] -= UDC_DEGREE_STEP;
+	}
+	else if (lat_dram < 1.5 * knob::udc_ideal_dram_time && max_index >= 0)
+	{
+		current_state[max_index] += UDC_DEGREE_STEP;
+	}
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "norm_effect\tstate\tlat_dram\tstand_lat" << endl;
+		for (size_t i = 0; i < NUM_PREFETCHERS; i++)
+		{
+			cout << norm_effect[i] << "\t" << current_state[i] << "\t" << lat_dram << "\t" << knob::udc_ideal_dram_time << endl;
+		}
+		cout << endl;
+	}
+	for (size_t i = 0; i < NUM_PREFETCHERS; i++)
+	{
+		if (current_state[i] < 0)
+		{
+			current_state[i]++;
+		}
+		else if (current_state[i] == 0)
+		{
+			if (lat_dram < 1.5 * knob::udc_ideal_dram_time)
+			{
+				// current_state[i] = knob::pref_degree;
+				current_state[i] = UDC_LOW_DEGREE;
+			}
+			// else if (lat_dram < 2 * knob::udc_ideal_dram_time)
+			// current_state[i] = UDC_LOW_DEGREE;
+		}
+		else
+		{
+			if (effect[i] < 0)
+				current_state[i] = -UDC_BLOCK_PHASE;
+		}
+	}
+#else // no dynamic degree
+	for (size_t i = 0; i < NUM_PREFETCHERS; i++)
+	{
+		if (current_state[i] < 0)
+		{
+			current_state[i]++;
+		}
+		else if (current_state[i] == 0)
+		{
+			if (lat_dram < 2 * (tRP + tRCD + tCAS))
+				current_state[i] = knob::pref_degree;
+		}
+		else
+		{
+			if (effect[i] < 0)
+				current_state[i] = -UDC_BLOCK_PHASE;
+		}
+	}
+#endif
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "new_state=" << current_state << endl;
+	}
+
+}
+
+void CACHE::l2c_prefetcher_initialize()
+{
+	for (uint32_t index = 0; index < knob::l2c_prefetcher_types.size(); ++index)
+	{
+		if (!knob::l2c_prefetcher_types[index].compare("none"))
+		{
+			cout << "adding L2C_PREFETCHER: NONE" << endl;
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("sms"))
+		{
+			cout << "adding L2C_PREFETCHER: SMS" << endl;
+			SMSPrefetcher *pref_sms = new SMSPrefetcher(knob::l2c_prefetcher_types[index]);
+			prefetchers.push_back(pref_sms);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("spp_dev2"))
+		{
+			cout << "adding L2C_PREFETCHER: SPP_dev2" << endl;
+			SPP_dev2 *pref_spp_dev2 = new SPP_dev2(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_spp_dev2);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("spp_ppf_dev"))
+		{
+			cout << "adding L2C_PREFETCHER: SPP_PPF_dev" << endl;
+			SPP_PPF_dev *pref_spp_ppf_dev = new SPP_PPF_dev(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_spp_ppf_dev);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("bingo"))
+		{
+			cout << "adding L2C_PREFETCHER: Bingo" << endl;
+			Bingo *pref_bingo = new Bingo(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_bingo);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("stride"))
+		{
+			cout << "adding L2C_PREFETCHER: Stride" << endl;
+			StridePrefetcher *pref_stride = new StridePrefetcher(knob::l2c_prefetcher_types[index]);
+			prefetchers.push_back(pref_stride);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("streamer"))
+		{
+			cout << "adding L2C_PREFETCHER: streamer" << endl;
+			Streamer *pref_streamer = new Streamer(knob::l2c_prefetcher_types[index]);
+			prefetchers.push_back(pref_streamer);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("domino"))
+		{
+			cout << "adding L2C_PREFETCHER: Domino" << endl;
+			Domino *pref_domino = new Domino(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_domino);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("sisb"))
+		{
+			cout << "adding L2C_PREFETCHER: sisb" << endl;
+			sisb *pref_sisb = new sisb(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_sisb);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("bop"))
+		{
+			cout << "adding L2C_PREFETCHER: BOP" << endl;
+			BOPrefetcher *pref_bop = new BOPrefetcher(knob::l2c_prefetcher_types[index]);
+			prefetchers.push_back(pref_bop);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("berti"))
+		{
+			cout << "adding L2C_PREFETCHER: Berti" << endl;
+			Berti *pref_berti = new Berti(knob::l2c_prefetcher_types[index], this, L2C_SET, L2C_WAY);
+			prefetchers.push_back(pref_berti);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("pmp"))
+		{
+			cout << "adding L2C_PREFETCHER: PMP" << endl;
+			PMP *pref_pmp = new PMP(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_pmp);
+		}
+		else if (!knob::l2c_prefetcher_types[index].compare("prophet"))
+		{
+			cout << "adding L2C_PREFETCHER: Prophet" << endl;
+			Prophet *pref_prophet = new Prophet(knob::l2c_prefetcher_types[index], this);
+			prefetchers.push_back(pref_prophet);
+		}
+		else
+		{
+			cout << "unsupported prefetcher type " << knob::l2c_prefetcher_types[index] << endl;
+			exit(1);
+		}
+	}
+	for (uint32_t index = 0; index < prefetchers.size(); ++index)
+	{
+		udc[cpu].current_state[index] = knob::pref_degree;
+		prefetchers[index]->set_degree(knob::pref_degree);
+	}
+	cout << endl
+		 << "Default degree = " << knob::pref_degree << endl
+		 << endl;
+	assert(knob::l2c_prefetcher_types.size() == prefetchers.size() || !knob::l2c_prefetcher_types[0].compare("none"));
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint64_t instr_id, uint64_t curr_cycle)
+{
+	udc[cpu].demand_count++;
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[l2c_prefetcher_operate]: addr=0x" << hex << addr << ", pc=0x" << ip << (cache_hit ? ", hit" : ", miss") << (type == PREFETCH ? ", prefetch" : ", load") << ", demand_count=" << dec << udc[cpu].demand_count << endl;
+	}
+
+#ifdef FINAL_PE
+	if (warmup_complete[cpu] && !final_pe_reset)
+	{
+		final_pe_reset = true;
+		reset_udc_info();
+		udc[cpu].reset_counters();
+	}
+#endif
+
+	if (cache_hit)
+		udc[cpu].cache_hit(addr);
+
+#ifndef FINAL_PE
+	if (udc[cpu].demand_count >= knob::phase_length)
+	{
+		if (warmup_complete[cpu])
+			udc[cpu].get_control_result(get_l3_latency(), get_dram_latency(), get_dram_count(), delay_count, delay_same_channel, delay_same_bank);
+		reset_udc_info();
+		udc[cpu].reset_counters();
+	}
+#endif
+
+	vector<uint64_t> pref_addr;
+	for (uint32_t index = 0; index < prefetchers.size(); ++index)
+	{
+		if (udc[cpu].current_state[index] > 0)
+		{
+			prefetchers[index]->set_degree(udc[cpu].current_state[index]);
+			prefetchers[index]->invoke_prefetcher(ip, addr, cache_hit, type, pref_addr);
+		}
+		for (auto &address : pref_addr)
+		{
+			prefetch_line(ip, addr, address, FILL_L2, 0, index);
+		}
+		if (UDC_DEBUG_LEVEL >= 2)
+		{
+			cout << "[pref_addr]--Prefetcher " << dec << index << ":" << endl
+				 << hex;
+			for (auto &address : pref_addr)
+			{
+				cout << "\t" << address << endl;
+			}
+		}
+		pref_addr.clear();
+	}
+	return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in, bool from_dram, uint32_t latency, bool merged, BoolPrefetchers issue_prefetcher)
+{
+	if (UDC_DEBUG_LEVEL >= 2)
+	{
+		cout << "[l2c_prefetcher_cache_fill]: addr=0x" << hex << addr << ", set=" << dec << set << (prefetch ? ", prefetch" : ", load") << ", from_dram=" << from_dram << ", issue_prefetcher=" << issue_prefetcher << endl;
+	}
+	// cache fills caused by load are in: function cache_operate
+
+	if (!prefetch){
+		if (from_dram)
+			udc[cpu].cache_miss_fill(addr, FILL_DRAM);
+		else
+			udc[cpu].cache_miss_fill(addr, FILL_LLC);
+	}else{
+		// is this prefetch issued by L2 prefetcher?
+		if (issue_prefetcher.prefetcher_count()){
+			udc[cpu].prefetch_fill(addr, from_dram, latency, issue_prefetcher);
+			udc[cpu].prefetch_caused_eviction(set, evicted_addr, issue_prefetcher); // TODO: Does fill caused by writeback need to call this function?
+		}
+	}
+
+	for (uint32_t index = 0; index < prefetchers.size(); ++index)
+	{
+		if (!prefetchers[index]->get_type().compare("sms"))
+		{
+			SMSPrefetcher *pref_sms = (SMSPrefetcher *)prefetchers[index];
+			pref_sms->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("spp_dev2"))
+		{
+			SPP_dev2 *pref_spp_dev2 = (SPP_dev2 *)prefetchers[index];
+			pref_spp_dev2->cache_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("spp_ppf_dev"))
+		{
+			SPP_PPF_dev *pref_spp_ppf_dev = (SPP_PPF_dev *)prefetchers[index];
+			pref_spp_ppf_dev->cache_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("bingo"))
+		{
+			Bingo *pref_bingo = (Bingo *)prefetchers[index];
+			pref_bingo->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("domino"))
+		{
+			Domino *pref_domino = (Domino *)prefetchers[index];
+			pref_domino->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("sisb"))
+		{
+			sisb *pref_sisb = (sisb *)prefetchers[index];
+			pref_sisb->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("bop"))
+		{
+			BOPrefetcher *pref_bop = (BOPrefetcher *)prefetchers[index];
+			pref_bop->register_fill(addr, prefetch);
+		}
+		else if (!prefetchers[index]->get_type().compare("berti"))
+		{
+			Berti *pref_berti = (Berti *)prefetchers[index];
+			pref_berti->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("pmp"))
+		{
+			PMP *pref_pmp = (PMP *)prefetchers[index];
+			pref_pmp->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+		else if (!prefetchers[index]->get_type().compare("prophet"))
+		{
+			Prophet *pref_prophet = (Prophet *)prefetchers[index];
+			pref_prophet->register_fill(addr, set, way, prefetch, evicted_addr);
+		}
+	}
+	return metadata_in;
+}
+
+
+uint32_t CACHE::l2c_prefetcher_prefetch_hit(uint64_t addr, uint64_t ip, uint32_t metadata_in)
+{
+	return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+	for (uint32_t index = 0; index < prefetchers.size(); ++index)
+	{
+		prefetchers[index]->dump_stats();
+	}
+
+	cout << "pollution_contribution " << 1.0 * udc[cpu].pollution_contribution_total / udc[cpu].pollution_contribution_count << endl;
+#ifdef FINAL_PE
+	int64_t useful_effect = 0, poll_effect = 0, delay_effect = 0, effect;
+	float row_buffer_miss_rate = 0;
+	for (size_t channel = 0; channel < DRAM_CHANNELS; channel++)
+	{
+		row_buffer_miss_rate += 1.0 * (uncore.DRAM.RQ[channel].ROW_BUFFER_MISS - udc[cpu].last_row_buffer_miss[channel]) / (uncore.DRAM.RQ[channel].ROW_BUFFER_MISS - udc[cpu].last_row_buffer_miss[channel] + uncore.DRAM.RQ[channel].ROW_BUFFER_HIT - udc[cpu].last_row_buffer_hit[channel]);
+	}
+	row_buffer_miss_rate = row_buffer_miss_rate / DRAM_CHANNELS;
+	useful_effect = (int64_t)(udc[cpu].useful_count_l3[0] * get_l3_latency() + udc[cpu].useful_count_dram[0] * get_dram_latency());
+	poll_effect = (int64_t)(udc[cpu].pollution_count_per[0] * get_l3_latency());
+	// delay_effect = (int64_t)(delay_count[i] * T_BUS + same_bank_count[i] * (tCAS + row_buffer_miss_rate * (tRP + tRCD)));
+	float t_bus = (1 + 2 * row_buffer_miss_rate) * T_CMD_BUS + T_DATA_BUS;
+	float t_bank = tCAS + row_buffer_miss_rate * (tRP + tRCD);
+	delay_effect = (int64_t)(T_NOC * delay_count[0] + t_bus * delay_same_channel[0] + t_bank * delay_same_bank[0]);
+	effect = useful_effect - poll_effect - delay_effect;
+	cout << "PE_Value " << effect << endl;
+#endif
+
+}
+
+void CACHE::l2c_prefetcher_print_config()
+{
+	for (uint32_t index = 0; index < prefetchers.size(); ++index)
+	{
+		prefetchers[index]->print_config();
+	}
+}
+
+void CACHE::l2c_prefetcher_broadcast_bw(uint8_t bw_level)
+{
+	return;
+}
+
+void CACHE::l2c_prefetcher_broadcast_ipc(uint8_t ipc)
+{
+	return;
+}
+
+void CACHE::l2c_prefetcher_broadcast_acc(uint32_t acc_level)
+{
+	return;
+}

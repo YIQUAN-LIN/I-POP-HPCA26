@@ -1,0 +1,581 @@
+#include <string>
+#include <assert.h>
+#include "cache.h"
+#include "prefetcher.h"
+#include "ooo_cpu.h"
+#include "alecto.h"
+
+/* Supported prefetchers at L2 */
+#include "sms.h"
+#include "next_line.h"
+#include "bop.h"
+#include "sandbox.h"
+#include "spp_dev2.h"
+#include "ppf_dev.h"
+#include "stride.h"
+#include "streamer.h"
+#include "domino.h"
+#include "sisb.h"
+#include "bingo.h"
+#include "vberti.h"
+#include "pmp.h"
+#include "prophet.h"
+
+#include <memory>
+
+using namespace std;
+
+namespace knob
+{
+    extern vector<string> l2c_prefetcher_types;
+    extern uint32_t pref_degree;
+}
+
+Alecto alecto[NUM_CPUS];
+
+Alecto::Alecto()
+{
+    memset(this, 0, sizeof(Alecto));
+}
+
+Alecto::~Alecto()
+{
+}
+
+vector<int8_t> Alecto::Access(uint64_t pc, uint64_t address)
+{
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[Access]: pc=0x" << hex << pc << ", address=0x" << address << endl;
+    uint16_t index = xor_fold(pc, 6) % ALECTO_ALLCATION_TABLE_SIZE;
+    uint16_t tag = (pc >> 6) & ((1ULL << 9) - 1);
+    vector<int8_t> control_result(NUM_PREFETCHERS, 3);
+    if (allocation_table[index].valid && allocation_table[index].tag == tag)
+    {
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            if (allocation_table[index].states[i] > 0)
+            {
+                control_result[i] += allocation_table[index].states[i];
+            }
+            else if (allocation_table[index].states[i] < 0)
+            {
+                control_result[i] = 0;
+            }
+        }
+    }
+    if (ALECTO_DEBUG_LEVEL >= 2)
+    {
+        cout << "alloc_index=" << dec << index << ", alloc_tag=0x" << hex << allocation_table[index].tag << ", find_tag=0x" << tag << endl;
+        cout << "degree=";
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            cout << dec << int(control_result[i]) << " ";
+        }
+        cout << endl;
+    }
+    CheckSandboxTable(address);
+    return control_result;
+}
+
+vector<uint64_t> Alecto::IssuePrefetch(uint64_t pc, bool dead, vector<vector<uint64_t>> &pref_addr)
+{
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[IssuePrefetch]: pc=0x" << hex << pc << ", dead=" << dead << endl;
+    uint16_t index = xor_fold(pc, 6) % ALECTO_SAMPLE_TABLE_SIZE;
+    uint16_t tag = (pc >> 6) & ((1ULL << 9) - 1);
+    vector<uint64_t> real_pref_addr;
+    if (ALECTO_DEBUG_LEVEL >= 2)
+        cout << "sampe_index=" << dec << index << ", sample_tag=0x" << hex << sample_table[index].tag << ", find_tag=0x" << tag << endl;
+
+    if (dead && !(sample_table[index].valid && sample_table[index].tag == tag))
+        return real_pref_addr;
+
+    if (!(sample_table[index].valid && sample_table[index].tag == tag))
+    {
+        if (sample_table[index].valid && sample_table[index].tag != tag)
+            EndOfPhase(index, sample_table[index]);
+        sample_table[index].reset();
+        sample_table[index].valid = true;
+        sample_table[index].tag = tag;
+        if (ALECTO_DEBUG_LEVEL >= 2)
+        {
+            cout << "[New_sample_entry]: sample_index=" << dec << index << ", sample_tag=0x" << hex << sample_table[index].tag << ", pc=0x" << pc << endl;
+        }
+    }
+
+    sample_table[index].demands++;
+    if (sample_table[index].demands >= ALECTO_PERIOD)
+    {
+        if (ALECTO_DEBUG_LEVEL >= 2)
+            cout << "demands reach threshold!" << endl;
+        EndOfPhase(index, sample_table[index]);
+        sample_table[index].demands = 0;
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            sample_table[index].confirmed[i] = 0;
+            sample_table[index].issued[i] = 0;
+        }
+    }
+    if (dead)
+    {
+        sample_table[index].deads++;
+        if (sample_table[index].deads >= ALECTO_DEAD_THRESH)
+            Dead(index);
+    }
+    else
+    {
+        if (sample_table[index].deads > 0)
+            sample_table[index].deads--;
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            sample_table[index].issued[i] += pref_addr[i].size();
+            if (ALECTO_DEBUG_LEVEL >= 2)
+            {
+                cout << "[PrefetchAddress]: pc=0x" << hex << pc << ", pref_addr[" << i << "]:" << hex << endl;
+            }
+            for (auto &address : pref_addr[i])
+            {
+                uint64_t block_address = address >> LOG2_BLOCK_SIZE;
+                uint16_t sb_index = xor_fold(block_address, 9) % ALECTO_SANDBOX_TABLE_SIZE;
+                uint16_t sb_tag = (block_address >> 9) & ((1ULL << 6) - 1);
+                if (sandbox_table[sb_index].tag != sb_tag)
+                {
+                    if (ALECTO_DEBUG_LEVEL >= 2)
+                    {
+                        cout << "\t0x" << address << "\treal" << endl;
+                    }
+                    sandbox_table[sb_index].reset();
+                    sandbox_table[sb_index].tag = sb_tag;
+                    real_pref_addr.push_back(address);
+                }
+                else if (ALECTO_DEBUG_LEVEL >= 2)
+                {
+                    cout << "\t0x" << address << endl;
+                }
+                sandbox_table[sb_index].issued[i] = true;
+                sandbox_table[sb_index].pc[i] = pc;
+            }
+        }
+    }
+    if (ALECTO_DEBUG_LEVEL >= 2)
+    {
+        cout << "[Update_sample_entry]: sample_index=" << dec << index << ", sample_tag=0x" << hex << sample_table[index].tag << ", demands=" << dec << int(sample_table[index].demands) << ", deads=" << int(sample_table[index].deads) << endl;
+        cout << "\t" << "confirm" << "\t" << "issue" << endl;
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            cout << "\t" << dec << int(sample_table[index].confirmed[i]) << "\t" << int(sample_table[index].issued[i]) << endl;
+        }
+    }
+    return real_pref_addr;
+}
+
+bool Alecto::CheckSandboxTable(uint64_t address)
+{
+    uint64_t block_address = address >> LOG2_BLOCK_SIZE;
+    uint16_t index = xor_fold(block_address, 9) % ALECTO_SANDBOX_TABLE_SIZE;
+    uint16_t tag = (block_address >> 9) & ((1ULL << 6) - 1);
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[CheckSandbox]: address=0x" << hex << address << ", block_addr=0x" << block_address << endl;
+    if (ALECTO_DEBUG_LEVEL >= 2)
+        cout << "sandbox_index=" << dec << index << ", sandbox_tag=0x" << hex << int(sandbox_table[index].tag) << ", find_tag=" << tag << endl;
+    if (tag == sandbox_table[index].tag)
+    {
+        // hit, useful prefetching
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            if (sandbox_table[index].issued[i])
+            {
+                // assert(sandbox_table[index].pc[i]);
+                SampleTableIncrease(sandbox_table[index].pc[i], i);
+            }
+        }
+        sandbox_table[index].reset();
+        return true;
+    }
+    return false;
+}
+
+bool Alecto::SampleTableIncrease(uint64_t pc, uint8_t prefetcher_index)
+{
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[SampleIncrease]: pc=0x" << hex << pc << ", prefetcher=" << dec << int(prefetcher_index) << endl;
+    uint16_t index = xor_fold(pc, 6) % ALECTO_SAMPLE_TABLE_SIZE;
+    uint16_t tag = (pc >> 6) & ((1ULL << 9) - 1);
+    if (ALECTO_DEBUG_LEVEL >= 2)
+    {
+        cout << "sample_index=" << dec << index << ", sample_tag=0x" << hex << sample_table[index].tag << ", find_tag=0x" << tag << endl;
+    }
+    if (sample_table[index].valid && sample_table[index].tag == tag)
+    {
+        sample_table[index].confirmed[prefetcher_index]++;
+        if (ALECTO_DEBUG_LEVEL >= 2)
+        {
+            cout << "\t" << "confirm" << "\t" << "issue" << endl;
+            for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+            {
+                cout << "\t" << dec << int(sample_table[index].confirmed[i]) << "\t" << int(sample_table[index].issued[i]) << endl;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void Alecto::EndOfPhase(uint16_t index, SampleTableData const &data)
+{
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[EndOfPhase]: sample_index=" << dec << index << ", sample_tag=0x" << hex << data.tag << ", alloc_tag=0x" << allocation_table[index].tag << endl;
+    float accuracy[NUM_PREFETCHERS];
+    for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        if (data.issued[i])
+            accuracy[i] = float(data.confirmed[i]) / data.issued[i];
+        else
+            accuracy[i] = -1;
+    if (ALECTO_DEBUG_LEVEL >= 2)
+    {
+        cout << "accuracy:";
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            cout << " " << dec << accuracy[i];
+        }
+        cout << endl;
+    }
+    if (allocation_table[index].valid && allocation_table[index].tag == data.tag)
+    {
+        if (ALECTO_DEBUG_LEVEL >= 2)
+        {
+            cout << "origin_alloc_entry:";
+            for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+            {
+                cout << " " << dec << int(allocation_table[index].states[i]);
+            }
+            cout << endl;
+        }
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            if (allocation_table[index].states[i] > 0)
+            {
+                if (accuracy[i] >= 0.75 && allocation_table[index].states[i] < 6)
+                    allocation_table[index].states[i]++;
+                else if (accuracy[i] < 0.75)
+                    allocation_table[index].states[i]--;
+            }
+            else if (allocation_table[index].states[i] == 0)
+            {
+                if (accuracy[i] >= 0.75)
+                    allocation_table[index].states[i] = 1;
+                else if (accuracy[i] < 0.05 && accuracy[i] >= 0)
+                    allocation_table[index].states[i] = -9;
+            }
+            else
+            {
+                if (allocation_table[index].states[i] < -1)
+                    allocation_table[index].states[i]++;
+                else
+                {
+                    bool no_ia = true;
+                    for (size_t j = 0; j < NUM_PREFETCHERS; ++j)
+                    {
+                        if (allocation_table[index].states[j] > 0)
+                        {
+                            no_ia = false;
+                            break;
+                        }
+                    }
+                    if (no_ia)
+                        allocation_table[index].states[i] = 0;
+                }
+            }
+        }
+    }
+    else
+    {
+        allocation_table[index].valid = true;
+        allocation_table[index].tag = data.tag;
+        bool high_acc = false, non_temporal = false;
+        vector<uint8_t> init_states(NUM_PREFETCHERS, 0);
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            if (accuracy[i] >= 0.75)
+            {
+                init_states[i] = 1;
+                high_acc = true;
+                if (i < NUM_PREFETCHERS - 1)
+                    non_temporal = true;
+            }
+            else if (accuracy[i] < 0.05 && accuracy[i] >= 0)
+            {
+                init_states[i] = -9;
+            }
+        }
+        if (high_acc)
+        {
+            for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+            {
+                if (init_states[i] == 0)
+                    init_states[i] = -1;
+            }
+        }
+        if (high_acc && non_temporal && init_states[NUM_PREFETCHERS - 1] >= 0)
+            init_states[NUM_PREFETCHERS - 1] = -1;
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            allocation_table[index].states[i] = init_states[i];
+        }
+    }
+    if (ALECTO_DEBUG_LEVEL >= 2)
+    {
+        cout << "new_alloc_entry:";
+        for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+        {
+            cout << " " << dec << int(allocation_table[index].states[i]);
+        }
+        cout << endl;
+    }
+}
+
+void Alecto::Dead(uint16_t index)
+{
+    if (ALECTO_DEBUG_LEVEL >= 1)
+        cout << "[Dead]: index=" << dec << index << endl;
+    sample_table[index].demands = 0;
+    for (size_t i = 0; i < NUM_PREFETCHERS; ++i)
+    {
+        allocation_table[index].states[i] = 0;
+        sample_table[index].confirmed[i] = 0;
+        sample_table[index].issued[i] = 0;
+    }
+}
+
+uint64_t Alecto::xor_fold(uint64_t key, int index_len)
+{
+    if (index_len == 0)
+        return key;
+    for (uint64_t tag = (key >> index_len); tag > 0; tag >>= index_len)
+        key ^= tag & ((1 << index_len) - 1);
+    return key;
+}
+
+void CACHE::l2c_prefetcher_initialize()
+{
+    for (uint32_t index = 0; index < knob::l2c_prefetcher_types.size(); ++index)
+    {
+        if (!knob::l2c_prefetcher_types[index].compare("none"))
+        {
+            cout << "adding L2C_PREFETCHER: NONE" << endl;
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("sms"))
+        {
+            cout << "adding L2C_PREFETCHER: SMS" << endl;
+            SMSPrefetcher *pref_sms = new SMSPrefetcher(knob::l2c_prefetcher_types[index]);
+            prefetchers.push_back(pref_sms);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("spp_dev2"))
+        {
+            cout << "adding L2C_PREFETCHER: SPP_dev2" << endl;
+            SPP_dev2 *pref_spp_dev2 = new SPP_dev2(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_spp_dev2);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("spp_ppf_dev"))
+        {
+            cout << "adding L2C_PREFETCHER: SPP_PPF_dev" << endl;
+            SPP_PPF_dev *pref_spp_ppf_dev = new SPP_PPF_dev(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_spp_ppf_dev);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("bingo"))
+        {
+            cout << "adding L2C_PREFETCHER: Bingo" << endl;
+            Bingo *pref_bingo = new Bingo(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_bingo);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("stride"))
+        {
+            cout << "adding L2C_PREFETCHER: Stride" << endl;
+            StridePrefetcher *pref_stride = new StridePrefetcher(knob::l2c_prefetcher_types[index]);
+            prefetchers.push_back(pref_stride);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("streamer"))
+        {
+            cout << "adding L2C_PREFETCHER: streamer" << endl;
+            Streamer *pref_streamer = new Streamer(knob::l2c_prefetcher_types[index]);
+            prefetchers.push_back(pref_streamer);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("domino"))
+        {
+            cout << "adding L2C_PREFETCHER: Domino" << endl;
+            Domino *pref_domino = new Domino(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_domino);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("sisb"))
+        {
+            cout << "adding L2C_PREFETCHER: sisb" << endl;
+            sisb *pref_sisb = new sisb(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_sisb);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("bop"))
+        {
+            cout << "adding L2C_PREFETCHER: BOP" << endl;
+            BOPrefetcher *pref_bop = new BOPrefetcher(knob::l2c_prefetcher_types[index]);
+            prefetchers.push_back(pref_bop);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("berti"))
+        {
+            cout << "adding L2C_PREFETCHER: Berti" << endl;
+            Berti *pref_berti = new Berti(knob::l2c_prefetcher_types[index], this, L2C_SET, L2C_WAY);
+            prefetchers.push_back(pref_berti);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("pmp"))
+        {
+            cout << "adding L2C_PREFETCHER: PMP" << endl;
+            PMP *pref_pmp = new PMP(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_pmp);
+        }
+        else if (!knob::l2c_prefetcher_types[index].compare("prophet"))
+        {
+            cout << "adding L2C_PREFETCHER: Prophet" << endl;
+            Prophet *pref_prophet = new Prophet(knob::l2c_prefetcher_types[index], this);
+            prefetchers.push_back(pref_prophet);
+        }
+        else
+        {
+            cout << "unsupported prefetcher type " << knob::l2c_prefetcher_types[index] << endl;
+            exit(1);
+        }
+    }
+    for (uint32_t index = 0; index < prefetchers.size(); ++index)
+    {
+        prefetchers[index]->set_degree(knob::pref_degree);
+    }
+    cout << endl
+         << "Default degree = " << knob::pref_degree << endl
+         << endl;
+    assert(knob::l2c_prefetcher_types.size() == prefetchers.size() || !knob::l2c_prefetcher_types[0].compare("none"));
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint64_t instr_id, uint64_t curr_cycle)
+{
+    vector<int8_t> control_result = alecto[cpu].Access(ip, addr);
+    vector<vector<uint64_t>> all_pref_addr;
+    bool dead = true;
+    for (uint32_t index = 0; index < prefetchers.size(); ++index)
+    {
+        if (control_result[index] <= 0)
+        {
+            all_pref_addr.push_back(vector<uint64_t>());
+            continue;
+        }
+        vector<uint64_t> pref_addr;
+        prefetchers[index]->set_degree(control_result[index]);
+        prefetchers[index]->invoke_prefetcher(ip, addr, cache_hit, type, pref_addr);
+        all_pref_addr.push_back(pref_addr);
+        if (!pref_addr.empty())
+            dead = false;
+    }
+    vector<uint64_t> real_pref_addr = alecto[cpu].IssuePrefetch(ip, dead, all_pref_addr);
+    for (auto &address : real_pref_addr)
+    {
+        prefetch_line(ip, addr, address, FILL_L2, 0);
+    }
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in, bool from_dram, uint32_t latency, bool merged, BoolPrefetchers issue_prefetcher)
+{
+
+    for (uint32_t index = 0; index < prefetchers.size(); ++index)
+    {
+        if (!prefetchers[index]->get_type().compare("sms"))
+        {
+            SMSPrefetcher *pref_sms = (SMSPrefetcher *)prefetchers[index];
+            pref_sms->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("spp_dev2"))
+        {
+            SPP_dev2 *pref_spp_dev2 = (SPP_dev2 *)prefetchers[index];
+            pref_spp_dev2->cache_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("spp_ppf_dev"))
+        {
+            SPP_PPF_dev *pref_spp_ppf_dev = (SPP_PPF_dev *)prefetchers[index];
+            pref_spp_ppf_dev->cache_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("bingo"))
+        {
+            Bingo *pref_bingo = (Bingo *)prefetchers[index];
+            pref_bingo->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("domino"))
+        {
+            Domino *pref_domino = (Domino *)prefetchers[index];
+            pref_domino->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("sisb"))
+        {
+            sisb *pref_sisb = (sisb *)prefetchers[index];
+            pref_sisb->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("bop"))
+        {
+            BOPrefetcher *pref_bop = (BOPrefetcher *)prefetchers[index];
+            pref_bop->register_fill(addr, prefetch);
+        }
+        else if (!prefetchers[index]->get_type().compare("berti"))
+        {
+            Berti *pref_berti = (Berti *)prefetchers[index];
+            pref_berti->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("pmp"))
+        {
+            PMP *pref_pmp = (PMP *)prefetchers[index];
+            pref_pmp->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+        else if (!prefetchers[index]->get_type().compare("prophet"))
+        {
+            Prophet *pref_prophet = (Prophet *)prefetchers[index];
+            pref_prophet->register_fill(addr, set, way, prefetch, evicted_addr);
+        }
+    }
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_prefetch_hit(uint64_t addr, uint64_t ip, uint32_t metadata_in)
+{
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    for (uint32_t index = 0; index < prefetchers.size(); ++index)
+    {
+        prefetchers[index]->dump_stats();
+    }
+}
+
+void CACHE::l2c_prefetcher_print_config()
+{
+    for (uint32_t index = 0; index < prefetchers.size(); ++index)
+    {
+        prefetchers[index]->print_config();
+    }
+}
+
+void CACHE::l2c_prefetcher_broadcast_bw(uint8_t bw_level)
+{
+    return;
+}
+
+void CACHE::l2c_prefetcher_broadcast_ipc(uint8_t ipc)
+{
+    return;
+}
+
+void CACHE::l2c_prefetcher_broadcast_acc(uint32_t acc_level)
+{
+    return;
+}
+
+void CACHE::forward_branch_info(uint64_t pc, uint64_t target)
+{
+    return;
+}
